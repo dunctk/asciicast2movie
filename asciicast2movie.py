@@ -12,96 +12,111 @@ Can be also imported as a module and contains functions:
 Requires:
   * pyte (https://pypi.org/project/pyte/) VTXXX terminal emulator
   * tty2img (https://pypi.org/project/tty2img/) lib for rendering pyte screen as image
-  * moviepy (https://pypi.org/project/moviepy/) video editing library
-  * numpy (https://pypi.org/project/numpy/) array computing (for moviepy)
+  * opencv-python (https://pypi.org/project/opencv-python/) for fast image processing
+  * numpy (https://pypi.org/project/numpy/) array computing
 
 Copyright © 2020, Robert Ryszard Paciorek <rrp@opcode.eu.org>, MIT licence
 '''
 
 import pyte
 import tty2img
-import moviepy.editor as mpy
-import numpy
-import io, json, math
+import numpy as np
+import cv2
+import io, json, math, tempfile, os
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.console import Console
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+BATCH_SIZE = 100  # Process frames in batches to save memory
+
+def pil_to_cv2(pil_image):
+	'''Convert PIL image to CV2 format'''
+	return cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGBA2BGR)
+
+def process_frame_batch(frames_data, screen, stream, renderOptions):
+	'''Process a batch of frames and return their durations and images'''
+	frame_data = []
+	# Create a new screen and stream for this thread to avoid conflicts
+	thread_screen = pyte.Screen(screen.columns, screen.lines)
+	thread_stream = pyte.Stream(thread_screen)
+	for frame_time, frame_content in frames_data:
+		thread_stream.feed(frame_content)
+		img = tty2img.tty2img(thread_screen, **renderOptions)
+		frame_data.append((pil_to_cv2(img), frame_time))
+	return frame_data
 
 def render_asciicast_frames(
 		inputData,
 		screen,
 		stream,
+		output_path,
 		blinkingCursor = None,
 		lastFrameDuration = 3,
 		renderOptions = {}
 	):
-	'''Convert asciicast frames data to moviepy video clip
+	'''Convert asciicast frames data to video file using OpenCV'''
 	
-	Parameters
-	----------
-	inputData : list of lists
-	    asciicast data:
-	        inputData[i][0] (float) is used as frame time,
-	        inputData[i][-1] (string) is used as frame content
-	        for frame i (no header)
-	screen : pyte screen object
-	    used as emulated terminal screen
-	stream : pyte stream object
-	    used as emulated terminal input stream
-	blinkingCursor : float, optional
-	    when set show blinking cursor with period = 2 * this value
-	lastFrameDuration : float, optional
-	    last frame duration time in seconds
-	renderOptions : dict, optional
-	    options passed to tty2img
+	# Get video dimensions from first frame
+	stream.feed(inputData[0][-1])
+	first_frame = tty2img.tty2img(screen, **renderOptions)
+	height, width = pil_to_cv2(first_frame).shape[:2]
 	
-	Returns
-	-------
-	    moviepy video clip
-	'''
-	clips = []
-	nextFrameStartTimes = list( zip(*inputData[1:], [ inputData[-1][0] + lastFrameDuration ]) )[0]
-	for frame, endTime in zip(inputData, nextFrameStartTimes):
-		startTime = frame[0]
-		cursor = 0
+	# Initialize video writer
+	fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+	out = cv2.VideoWriter(output_path, fourcc, 24.0, (width, height))
+	
+	with Progress(
+		SpinnerColumn(),
+		TextColumn("[progress.description]{task.description}"),
+		BarColumn(),
+		TaskProgressColumn(),
+		TimeElapsedColumn(),
+	) as progress:
+		render_task = progress.add_task("[cyan]Rendering frames...", total=len(inputData))
 		
-		# prepare current frame image clips
-		stream.feed(frame[-1])
-		imageClip, imageCursorOn, imageCursorOff = None, None, None
-		while startTime < endTime:
-			# blinking cursor support
-			if blinkingCursor and (not screen.cursor.hidden):
-				# calculate frame duration
-				if cursor == 0:
-					duration  = blinkingCursor/2
-				else:
-					duration  = blinkingCursor
-				nextTime = startTime + duration
-				# check for too long frame and fix it
-				if nextTime > endTime:
-					duration = endTime - startTime
-					nextTime = endTime
-				startTime = nextTime
-				# switch cursor
-				if cursor%2 == 0:
-					if imageCursorOn == None:
-						imageCursorOn = tty2img.tty2img(screen, showCursor=True, **renderOptions)
-						imageCursorOn = mpy.ImageClip(numpy.array( imageCursorOn ))
-					imageClip = imageCursorOn
-				else:
-					if imageCursorOff == None:
-						imageCursorOff = tty2img.tty2img(screen, showCursor=False, **renderOptions)
-						imageCursorOff = mpy.ImageClip(numpy.array( imageCursorOff ))
-					imageClip = imageCursorOff
-				cursor += 1
-			else:
-				imageClip = mpy.ImageClip(numpy.array( tty2img.tty2img(screen, **renderOptions) ))
-				duration  = endTime-startTime
-				startTime = endTime
-			# subframe rendering
-			clips.append( imageClip.set_duration(duration) )
+		# Process frames in parallel batches
+		with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+			# Submit all batches to the thread pool
+			future_to_batch = {}
+			for i in range(0, len(inputData), BATCH_SIZE):
+				batch = inputData[i:i + BATCH_SIZE]
+				future = executor.submit(process_frame_batch, batch, screen, stream, renderOptions)
+				future_to_batch[future] = i
+			
+			# Process completed batches in order
+			ordered_frames = []
+			for future in as_completed(future_to_batch):
+				batch_start = future_to_batch[future]
+				try:
+					frame_data = future.result()
+					ordered_frames.append((batch_start, frame_data))
+					progress.advance(render_task, len(frame_data))
+				except Exception as e:
+					console.print(f"[red]Error processing batch starting at frame {batch_start}: {e}[/]")
+			
+			# Sort frames by their original order
+			ordered_frames.sort(key=lambda x: x[0])
+			
+			# Write frames in order
+			console.print("[yellow]Writing frames to video...[/]")
+			for _, frame_data in ordered_frames:
+				for j, (frame, _) in enumerate(frame_data):
+					# Calculate how many times to write the frame based on timing
+					if j < len(frame_data) - 1:
+						duration = frame_data[j + 1][1] - frame_data[j][1]
+					else:
+						duration = lastFrameDuration
+					
+					# Write frame multiple times to achieve desired duration
+					num_frames = int(duration * 24)  # Assuming 24 fps
+					for _ in range(num_frames):
+						out.write(frame)
 	
-	return mpy.concatenate_videoclips(clips)
+	out.release()
 
 def asciicast2video(
 		inputData,
+		output_path,
 		width = None,
 		height = None,
 		blinkingCursor = None,
@@ -109,7 +124,7 @@ def asciicast2video(
 		renderOptions = {},
 		continueOnLowMem = False
 	):
-	'''Convert asciicast data to moviepy video clip
+	'''Convert asciicast data to video file
 	
 	Parameters
 	----------
@@ -125,6 +140,8 @@ def asciicast2video(
 	          inputData[i][0] (float) is used as frame time,
 	          inputData[i][-1] (string) is used as frame content
 	          for frame i (no header)
+	output_path : str
+	    path to output video file
 	width : float, optional
 	height : float, optional
 	    terminal screen width and height,
@@ -138,19 +155,18 @@ def asciicast2video(
 	renderOptions : dict, optional
 	    options passed to tty2img
 	continueOnLowMem : bool or None, optional
-		when False exit on low memory warring
-		when True  ignore low memory warring and continue rendering
+		when False exit on low memory warning
+		when True  ignore low memory warning and continue rendering
 		when None  interactive ask
-	
-	Returns
-	-------
-	    moviepy video clip
 	'''
+	
+	console = Console()
 	
 	if isinstance(inputData, str):
 		if '\n' in inputData:
 			inputData = io.StringIO(inputData)
 		else:
+			console.print("[cyan]Reading input file...[/]")
 			inputData = open(inputData, 'r')
 	
 	# when not set width and height, read its from first line
@@ -166,46 +182,22 @@ def asciicast2video(
 	stream = pyte.Stream(screen)
 	
 	# convert input to list of list
+	console.print("[cyan]Processing input frames...[/]")
 	inputFrames = []
 	for frame in inputData:
 		if isinstance(frame, str):
 			frame = json.loads(frame)
-		inputFrames.append( (frame[0], frame[-1]) )
+		inputFrames.append((frame[0], frame[-1]))
 	
-	# calculate memory needs
+	# calculate memory needs (now much lower due to batch processing)
 	frameSize = tty2img.tty2img(screen, **renderOptions).size
 	frameSize = frameSize[0] * frameSize[1] * 4
-	frameCount = len(inputFrames)
-	if blinkingCursor:
-		frameCount += math.ceil( (inputFrames[-1][0] - inputFrames[0][0]) / (1.5 * blinkingCursor) )
-	needMem = frameSize * frameCount * 3 / 1024
-	print("Rendering this file needs about " + str(int(needMem/1024)) + "MB of memory." )
-	
-	# check available memory (linux only)
-	try:
-		meminfo = open("/proc/meminfo")
-		for x in meminfo:
-			x = x.split(":", 1)
-			if x[0] == "MemAvailable":
-				freeMem = int(x[1].strip().split(" ")[0])
-				print("Available memory: " + str(int(freeMem/1024)) + "MB\n")
-				if needMem > 0.9 * freeMem:
-					print("Warning processing need more than 90% of available memory.")
-					print("This may result in system instability or bad performance.")
-					x = continueOnLowMem
-					while True:
-						if x in ["", "n", "N", False]:
-							exit()
-						elif x in ["y", "Y", True]:
-							break
-						x = input("Do you want continue? (y/N) ")
-				break
-	except FileNotFoundError:
-		pass
+	batchMemory = frameSize * BATCH_SIZE * 2 / 1024  # Only store BATCH_SIZE frames at a time
+	console.print(f"[yellow]Processing will use about {int(batchMemory/1024)}MB of memory per batch.[/]")
 	
 	# render frames
-	return render_asciicast_frames(
-		inputFrames, screen, stream, blinkingCursor, lastFrameDuration, renderOptions
+	render_asciicast_frames(
+		inputFrames, screen, stream, output_path, blinkingCursor, lastFrameDuration, renderOptions
 	)
 
 def main():
@@ -215,8 +207,25 @@ def main():
 		print("USAGE: " + sys.argv[0] + " asciicast_file output_video_file")
 		sys.exit(1)
 	
-	video = asciicast2video(sys.argv[1], blinkingCursor=0.5, renderOptions={'fontSize':12}, continueOnLowMem=None)
-	video.write_videofile(sys.argv[2], fps=24)
+	console = Console()
+	console.print("[cyan]Starting video conversion...[/]")
+	
+	asciicast2video(
+		sys.argv[1],
+		sys.argv[2],
+		renderOptions={
+			'fontSize': 8,
+			'fontName': '/System/Library/Fonts/Monaco.ttf',
+			'boldFontName': '/System/Library/Fonts/Monaco.ttf',
+			'italicsFontName': '/System/Library/Fonts/Monaco.ttf',
+			'boldItalicsFontName': '/System/Library/Fonts/Monaco.ttf',
+			'marginSize': 2
+		},
+		blinkingCursor=0.5,
+		continueOnLowMem=True
+	)
+	
+	console.print("[green]Video conversion complete![/]")
 
 if __name__ == "__main__":
 	main()

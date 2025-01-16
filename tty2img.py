@@ -105,10 +105,10 @@ def tty2img(
 		boldItalicsFont[1] = freetype.Face(boldItalicsFont[0].path)
 	
 	# calculate single char and image size
-	charWidth, _ = normalFont[0].getsize('X')
-	charHeight   = sum(normalFont[0].getmetrics()) + lineSpace
-	imgWidth     = charWidth  * screen.columns + 2*marginSize
-	imgHeight    = charHeight * screen.lines + 2*marginSize
+	charWidth = int(normalFont[0].getlength('X'))
+	charHeight = int(fontSize)
+	imgWidth = int(charWidth * screen.columns + 2*marginSize)
+	imgHeight = int(charHeight * screen.lines + 2*marginSize)
 	
 	# create image object
 	image = Image.new('RGBA', (imgWidth, imgHeight), bgDefaultColor)

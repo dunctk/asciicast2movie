@@ -1,0 +1,15 @@
+[project]
+name = "asciicast2movie"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "moviepy>=2.1.2",
+    "numpy>=2.2.1",
+    "opencv-python>=4.10.0.84",
+    "pillow>=10.4.0",
+    "pyte>=0.8.2",
+    "rich>=13.9.4",
+    "tty2img>=0.3.6",
+]
